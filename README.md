@@ -26,8 +26,10 @@ An HTTP 200 response without the expected database state is reported as a
 failure. This is the defining behaviour of the project. A non-2xx response also
 fails the scenario, even when the stored payment happens to match.
 
-This is the only implemented scenario. Duplicate delivery, retries, other
-providers, and scenario files are not implemented.
+This is the only implemented engine scenario. The example application handles
+repeated successful deliveries idempotently by payment reference, but
+duplicate-delivery scenarios in the engine, retries, other providers, and
+scenario files are not implemented.
 
 ## Requirements
 
@@ -150,6 +152,19 @@ SQLite database and `payments` table.
    timeout.
 6. The expected reference, amount, currency, and status must all match.
 
+### Duplicate deliveries
+
+The example application uses the payment `reference` as its idempotency key.
+When a valid `charge.success` event is repeated with the same reference, amount,
+currency, and status, the handler returns HTTP 200 without inserting another
+row. If the reference already exists with a different amount or currency, the
+handler returns HTTP 409 and leaves the original row unchanged. Genuine
+database errors still return HTTP 500.
+
+This is payment-reference idempotency in the example application only. It is
+not general event-ID-based deduplication, and the engine still refuses to send
+a reference that already exists in the database.
+
 Database errors are reported distinctly from a missing payment row. A failed
 query is never treated as evidence that no payment exists.
 
@@ -170,6 +185,9 @@ Coverage includes:
   vector, plus changed-body and wrong-secret rejection.
 - Correctly signed events persisted, and invalid signatures, malformed JSON,
   and unsupported events rejected without writing a row.
+- Repeated and conflicting deliveries to the example handler: exact duplicates
+  return 200 with one stored row, while a reused reference with a different
+  amount or currency returns 409 and leaves the original unchanged.
 - An end-to-end pass where the expected reference, amount, currency, and status
   are all present in SQLite.
 - A failure when a handler returns HTTP 200 without writing any state, and when
@@ -190,12 +208,13 @@ Implemented:
 - One HTTP webhook delivery with non-2xx rejection
 - Read-only SQLite state verification
 - SQLite-backed example application
+- Idempotent duplicate handling in the example app by payment reference
 - PASS/FAIL reporting and CI-friendly exit codes
 - Automated tests, including the HTTP-200-without-state and non-2xx regressions
 
 Planned, but not implemented:
 
-- Duplicate-delivery and retry scenarios
+- Engine-driven duplicate-delivery and retry scenarios
 - Additional Paystack event types
 - Other payment providers and webhook systems
 - A scenario configuration format, which is still undecided
