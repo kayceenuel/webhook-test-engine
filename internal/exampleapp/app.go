@@ -106,14 +106,37 @@ func (a *App) handlePaystack(w http.ResponseWriter, r *http.Request) {
 	}
 
 	receivedAt := time.Now().UTC().Format(time.RFC3339Nano)
-	_, err = a.db.ExecContext(r.Context(),
+	result, err := a.db.ExecContext(r.Context(),
 		`INSERT INTO payments (reference, amount, currency, status, received_at)
-		 VALUES (?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(reference) DO NOTHING`,
 		payment.Reference, payment.Amount, payment.Currency, payment.Status, receivedAt,
 	)
 	if err != nil {
 		http.Error(w, "failed to persist payment", http.StatusInternalServerError)
 		return
+	}
+
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		http.Error(w, "failed to persist payment", http.StatusInternalServerError)
+		return
+	}
+	if inserted == 0 {
+		var amount int64
+		var currency, status string
+		err := a.db.QueryRowContext(r.Context(),
+			`SELECT amount, currency, status FROM payments WHERE reference = ?`,
+			payment.Reference,
+		).Scan(&amount, &currency, &status)
+		if err != nil {
+			http.Error(w, "failed to load existing payment", http.StatusInternalServerError)
+			return
+		}
+		if amount != payment.Amount || currency != payment.Currency || status != payment.Status {
+			http.Error(w, "payment reference already exists with different details", http.StatusConflict)
+			return
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
