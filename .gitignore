@@ -1,2 +1,27 @@
 # Environment files
 .env
+
+# Go build artifacts
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+*.prof
+coverage.out
+coverage.html
+
+# Go workspaces
+go.work
+go.work.sum
+
+# Local example database
+/example.db
+/example.db-shm
+/example.db-wal
