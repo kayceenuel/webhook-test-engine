@@ -15,21 +15,23 @@ scenario:
 
 - The engine builds a synthetic payment event.
 - It signs the exact JSON request body with HMAC-SHA512.
-- It sends one HTTP POST with the `X-Paystack-Signature` header.
+- It sends the same HTTP POST once, or the requested number of times
+  sequentially, with the `X-Paystack-Signature` header.
 - The example application verifies the signature and writes the payment to
   SQLite.
 - The engine opens the database read-only and polls for the expected payment.
-- The test passes only when the HTTP response is 2xx **and** the stored
+- The test passes only when every HTTP response is 2xx **and** the stored
   reference, amount, currency, and status all match.
+- With repeated delivery, exactly one payment record must exist for the
+  reference.
 
 An HTTP 200 response without the expected database state is reported as a
 failure. This is the defining behaviour of the project. A non-2xx response also
 fails the scenario, even when the stored payment happens to match.
 
-This is the only implemented engine scenario. The example application handles
-repeated successful deliveries idempotently by payment reference, but
-duplicate-delivery scenarios in the engine, retries, other providers, and
-scenario files are not implemented.
+This is the only implemented engine scenario. Repeated delivery reuses the same
+signed request; different events for the same payment, retries, other providers,
+and scenario files are not implemented.
 
 ## Requirements
 
@@ -83,7 +85,24 @@ A successful run prints:
 PASS paystack reference=whe_... http=200 state=verified
 ```
 
-A failure prints a `FAIL` line with the HTTP status and the reason, for example:
+To deliver the same signed webhook twice and check for duplicate records, add
+`--deliveries`:
+
+```powershell
+go run ./cmd/webhook-test `
+  --target http://127.0.0.1:8080/webhooks/paystack `
+  --db .\example.db `
+  --secret dev-secret `
+  --deliveries 2
+```
+
+A successful duplicate-delivery run prints one status per delivery:
+
+```text
+PASS paystack reference=whe_... http=200,200 state=verified
+```
+
+A failure prints a `FAIL` line with the HTTP statuses and the reason, for example:
 
 ```text
 FAIL paystack reference=whe_... http=200: expected payment "whe_..." not found before timeout
@@ -91,7 +110,7 @@ FAIL paystack reference=whe_... http=200: expected payment "whe_..." not found b
 
 The engine exits with:
 
-- `0` when the webhook was delivered and the expected state was verified.
+- `0` when every delivery was accepted and the expected state was verified.
 - `1` when delivery, HTTP, database, timeout, or state verification failed.
 - `2` for invalid command-line usage.
 
@@ -109,10 +128,15 @@ when a script depends on the exact code.
 | `--reference` | generated | Payment reference to send and verify |
 | `--amount` | `50000` | Amount in minor currency units |
 | `--currency` | `NGN` | Payment currency |
-| `--timeout` | `2s` | HTTP delivery and state verification timeout |
+| `--deliveries` | `1` | Number of times to deliver the same signed webhook sequentially |
+| `--timeout` | `2s` | Total timeout for preflight, all deliveries, and state verification |
 
 Amounts use integer minor currency units. For NGN, `50000` means 500.00 NGN
 (kobo). The engine does not convert or round amounts.
+
+`--timeout` is one budget for the whole scenario, not a per-delivery timeout.
+Raising `--deliveries` therefore leaves less time for each delivery and for the
+final state check.
 
 ## Database contract
 
@@ -143,14 +167,17 @@ SQLite database and `payments` table.
 ## How it works
 
 1. The Paystack adapter builds a minimal `charge.success` event and signs the
-   exact serialized body with HMAC-SHA512.
+   exact serialized body with HMAC-SHA512. The request is built once.
 2. The engine checks that the reference does not already exist in SQLite, so an
    old row cannot produce a false pass.
-3. The engine sends one HTTP POST with a bounded timeout.
-4. Non-2xx responses fail immediately.
-5. The engine opens SQLite read-only and polls every 50 ms until the configured
-   timeout.
+3. The engine sends the webhook, or `--deliveries` copies of it, sequentially.
+   Every delivery reuses the same body and signature.
+4. A transport error or non-2xx response fails immediately. With multiple
+   deliveries, the failure names the delivery number.
+5. After the first delivery of a multi-delivery run, and after the final
+   delivery, the engine polls SQLite every 50 ms until the configured timeout.
 6. The expected reference, amount, currency, and status must all match.
+7. Exactly one record must exist for that reference.
 
 ### Duplicate deliveries
 
@@ -161,9 +188,22 @@ row. If the reference already exists with a different amount or currency, the
 handler returns HTTP 409 and leaves the original row unchanged. Genuine
 database errors still return HTTP 500.
 
-This is payment-reference idempotency in the example application only. It is
-not general event-ID-based deduplication, and the engine still refuses to send
-a reference that already exists in the database.
+The engine can send the same signed webhook more than once with `--deliveries`.
+The request is built once, so every delivery carries the exact same body and
+signature rather than a newly generated event. Deliveries are sequential and
+the run stops at the first transport error or non-2xx response. The engine
+verifies the expected payment and exactly one matching record after the first
+delivery and again after the final delivery. This catches an application that
+ignores the first event and persists only on a later duplicate.
+
+For a single delivery, the state check runs once as before. The record count is
+a point-in-time check after delivery; it cannot prove that no asynchronous write
+happens later. The engine also refuses to send a reference that already exists
+in the database.
+
+This feature tests repeated delivery of one webhook. It does not test different
+events relating to the same payment, concurrent duplicate delivery, retries,
+backoff, or general event-ID-based deduplication.
 
 Database errors are reported distinctly from a missing payment row. A failed
 query is never treated as evidence that no payment exists.
@@ -190,6 +230,15 @@ Coverage includes:
   amount or currency returns 409 and leaves the original unchanged.
 - An end-to-end pass where the expected reference, amount, currency, and status
   are all present in SQLite.
+- Two sequential deliveries of the same request: both return 200, the bodies
+  and signatures are identical, and only one payment record is stored.
+- One delivery remains the default when `--deliveries` is omitted.
+- A failure when an application stores a second record for the same reference.
+- A failure with the delivery number and recorded statuses when a later
+  delivery returns a non-2xx response.
+- A failure when the first delivery returns 200 but never persists the payment,
+  even if a later delivery would.
+- Rejection of negative delivery counts in the engine and CLI.
 - A failure when a handler returns HTTP 200 without writing any state, and when
   it persists the wrong amount.
 - A failure on a non-2xx response even when the persisted state happens to
@@ -205,8 +254,10 @@ Implemented:
 
 - Go CLI and engine orchestration
 - Paystack `charge.success` event generation and HMAC-SHA512 signatures
-- One HTTP webhook delivery with non-2xx rejection
-- Read-only SQLite state verification
+- One or more sequential deliveries of the same signed webhook, with non-2xx
+  rejection and per-delivery HTTP status reporting
+- Read-only SQLite state verification, including exactly-one-record checks for
+  duplicate deliveries
 - SQLite-backed example application
 - Idempotent duplicate handling in the example app by payment reference
 - PASS/FAIL reporting and CI-friendly exit codes
@@ -214,7 +265,8 @@ Implemented:
 
 Planned, but not implemented:
 
-- Engine-driven duplicate-delivery and retry scenarios
+- Different events for the same payment and retry/backoff scenarios
+- Concurrent duplicate delivery
 - Additional Paystack event types
 - Other payment providers and webhook systems
 - A scenario configuration format, which is still undecided
