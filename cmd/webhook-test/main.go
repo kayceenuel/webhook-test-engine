@@ -37,6 +37,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	amount := flags.Int64("amount", 50000, "amount in minor currency units, such as kobo")
 	currency := flags.String("currency", "NGN", "payment currency")
 	timeout := flags.Duration("timeout", 2*time.Second, "HTTP delivery and state verification timeout")
+	deliveries := flags.Int("deliveries", 1, "number of times to deliver the same webhook sequentially")
 
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -67,6 +68,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stderr, "--timeout must be greater than zero")
 		return 2
 	}
+	if *deliveries < 1 {
+		_, _ = fmt.Fprintln(stderr, "--deliveries must be at least 1")
+		return 2
+	}
 	if parsed, err := url.Parse(*target); err != nil ||
 		(parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		_, _ = fmt.Fprintln(stderr, "--target must be an absolute http or https URL")
@@ -86,6 +91,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		TargetURL:    *target,
 		DatabasePath: *databasePath,
 		Timeout:      *timeout,
+		Deliveries:   *deliveries,
 		Expected: provider.Payment{
 			Reference: *reference,
 			Amount:    *amount,
