@@ -1,12 +1,15 @@
 package engine_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -63,6 +66,18 @@ func runTest(t *testing.T, scenario engine.Scenario) engine.Result {
 	return result
 }
 
+func assertStatuses(t *testing.T, result engine.Result, want ...int) {
+	t.Helper()
+	if len(result.HTTPStatuses) != len(want) {
+		t.Fatalf("HTTP statuses = %v, want %v", result.HTTPStatuses, want)
+	}
+	for i := range want {
+		if result.HTTPStatuses[i] != want[i] {
+			t.Fatalf("HTTP statuses = %v, want %v", result.HTTPStatuses, want)
+		}
+	}
+}
+
 func openDatabase(t *testing.T, dbPath string) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", dbPath)
@@ -106,9 +121,7 @@ func TestRunPassesWhenStateMatches(t *testing.T) {
 	if !result.Passed {
 		t.Fatalf("result = %+v, want PASS", result)
 	}
-	if result.HTTPStatus != http.StatusOK {
-		t.Fatalf("HTTP status = %d, want 200", result.HTTPStatus)
-	}
+	assertStatuses(t, result, http.StatusOK)
 
 	db := openDatabase(t, dbPath)
 	stored := provider.Payment{Reference: expected.Reference}
@@ -142,9 +155,7 @@ func TestRunFailsWhenHTTP200DoesNotChangeState(t *testing.T) {
 		1*time.Second,
 	))
 
-	if result.HTTPStatus != http.StatusOK {
-		t.Fatalf("HTTP status = %d, want 200; failure = %q", result.HTTPStatus, result.Failure)
-	}
+	assertStatuses(t, result, http.StatusOK)
 	if result.Passed {
 		t.Fatal("result passed from HTTP 200 alone, want failure")
 	}
@@ -196,9 +207,7 @@ func TestRunFailsWhenPersistedAmountIsWrong(t *testing.T) {
 	if result.Passed {
 		t.Fatal("result passed with the wrong amount, want failure")
 	}
-	if result.HTTPStatus != http.StatusOK {
-		t.Fatalf("HTTP status = %d, want 200", result.HTTPStatus)
-	}
+	assertStatuses(t, result, http.StatusOK)
 	if result.Actual == nil || result.Actual.Amount != expected.Amount+1 {
 		t.Fatalf("actual = %+v, want the persisted wrong amount", result.Actual)
 	}
@@ -236,9 +245,7 @@ func TestRunFailsOnNon2xxEvenWhenStateMatches(t *testing.T) {
 	if result.Passed {
 		t.Fatal("result passed on an HTTP 500 response, want failure")
 	}
-	if result.HTTPStatus != http.StatusInternalServerError {
-		t.Fatalf("HTTP status = %d, want 500", result.HTTPStatus)
-	}
+	assertStatuses(t, result, http.StatusInternalServerError)
 	if result.Actual != nil {
 		t.Fatalf("actual = %+v, want nil; state must not be accepted after a non-2xx response", result.Actual)
 	}
@@ -281,8 +288,8 @@ func TestRunRejectsExistingReference(t *testing.T) {
 	if result.Passed {
 		t.Fatal("result passed for an existing reference, want failure")
 	}
-	if result.HTTPStatus != 0 {
-		t.Fatalf("HTTP status = %d, want 0 (webhook must not be sent)", result.HTTPStatus)
+	if len(result.HTTPStatuses) != 0 {
+		t.Fatalf("HTTP statuses = %v, want none (webhook must not be sent)", result.HTTPStatuses)
 	}
 	if requests.Load() != 0 {
 		t.Fatalf("webhook requests = %d, want 0", requests.Load())
@@ -364,5 +371,259 @@ func TestRunReportsHTTPTimeout(t *testing.T) {
 	}
 	if !strings.Contains(result.Failure, "delivery failed") {
 		t.Fatalf("failure = %q, want an HTTP delivery failure, not a database timeout", result.Failure)
+	}
+}
+
+func TestRunPassesWithTwoDeliveries(t *testing.T) {
+	app, dbPath := newTestApp(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		app.Handler().ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	expected := expectedPayment("ref_two_deliveries")
+	scenario := testScenario(server.URL+"/webhooks/paystack", dbPath, expected, 5*time.Second)
+	scenario.Deliveries = 2
+	result := runTest(t, scenario)
+
+	if !result.Passed {
+		t.Fatalf("result = %+v, want PASS", result)
+	}
+	assertStatuses(t, result, http.StatusOK, http.StatusOK)
+	if requests.Load() != 2 {
+		t.Fatalf("webhook requests = %d, want 2", requests.Load())
+	}
+
+	db := openDatabase(t, dbPath)
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM payments WHERE reference = ?`,
+		expected.Reference,
+	).Scan(&count); err != nil {
+		t.Fatalf("count stored payments: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("payment count = %d, want 1", count)
+	}
+}
+
+func TestRunReusesSameRequestForEveryDelivery(t *testing.T) {
+	app, dbPath := newTestApp(t)
+
+	var mu sync.Mutex
+	var bodies [][]byte
+	var signatures []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			http.Error(w, "read failed", http.StatusInternalServerError)
+			return
+		}
+		mu.Lock()
+		bodies = append(bodies, body)
+		signatures = append(signatures, r.Header.Get(paystack.SignatureHeader))
+		mu.Unlock()
+
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		app.Handler().ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	scenario := testScenario(
+		server.URL+"/webhooks/paystack",
+		dbPath,
+		expectedPayment("ref_same_request"),
+		5*time.Second,
+	)
+	scenario.Deliveries = 3
+	result := runTest(t, scenario)
+
+	if !result.Passed {
+		t.Fatalf("result = %+v, want PASS", result)
+	}
+	assertStatuses(t, result, http.StatusOK, http.StatusOK, http.StatusOK)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 3 {
+		t.Fatalf("webhook requests = %d, want 3", len(bodies))
+	}
+	if signatures[0] == "" {
+		t.Fatal("signature header is empty, want the signed request header")
+	}
+	for i := 1; i < len(bodies); i++ {
+		if !bytes.Equal(bodies[0], bodies[i]) {
+			t.Fatalf("delivery %d body = %q, want the same body as delivery 1 %q",
+				i+1, bodies[i], bodies[0])
+		}
+		if signatures[i] != signatures[0] {
+			t.Fatalf("delivery %d signature = %q, want %q",
+				i+1, signatures[i], signatures[0])
+		}
+	}
+}
+
+func TestRunDefaultsToOneDelivery(t *testing.T) {
+	app, dbPath := newTestApp(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		app.Handler().ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	expected := expectedPayment("ref_default_delivery")
+	result := runTest(t, testScenario(
+		server.URL+"/webhooks/paystack",
+		dbPath,
+		expected,
+		5*time.Second,
+	))
+
+	if !result.Passed {
+		t.Fatalf("result = %+v, want PASS", result)
+	}
+	assertStatuses(t, result, http.StatusOK)
+	if requests.Load() != 1 {
+		t.Fatalf("webhook requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestRunFailsWhenDuplicateDeliveryCreatesExtraRecords(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "duplicates.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("db.Close() error = %v", err)
+		}
+	})
+	if _, err := db.Exec(`CREATE TABLE payments (
+		reference   TEXT NOT NULL,
+		amount      INTEGER NOT NULL,
+		currency    TEXT NOT NULL,
+		status      TEXT NOT NULL,
+		received_at TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create payments table: %v", err)
+	}
+
+	expected := expectedPayment("ref_duplicate_records")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, err := db.Exec(
+			`INSERT INTO payments (reference, amount, currency, status, received_at)
+			 VALUES (?, ?, ?, ?, ?)`,
+			expected.Reference, expected.Amount, expected.Currency, expected.Status,
+			time.Now().UTC().Format(time.RFC3339Nano),
+		)
+		if err != nil {
+			t.Errorf("insert payment: %v", err)
+			http.Error(w, "insert failed", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	scenario := testScenario(server.URL+"/webhooks/paystack", dbPath, expected, 5*time.Second)
+	scenario.Deliveries = 2
+	result := runTest(t, scenario)
+
+	if result.Passed {
+		t.Fatal("result passed with duplicate payment records, want failure")
+	}
+	assertStatuses(t, result, http.StatusOK, http.StatusOK)
+	if !strings.Contains(result.Failure, `found 2 records for reference "ref_duplicate_records"`) {
+		t.Fatalf("failure = %q, want a duplicate-record message", result.Failure)
+	}
+}
+
+func TestRunFailsWhenSecondDeliveryReturns500(t *testing.T) {
+	app, dbPath := newTestApp(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 2 {
+			http.Error(w, "handler reported failure", http.StatusInternalServerError)
+			return
+		}
+		app.Handler().ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	scenario := testScenario(
+		server.URL+"/webhooks/paystack",
+		dbPath,
+		expectedPayment("ref_second_delivery_500"),
+		5*time.Second,
+	)
+	scenario.Deliveries = 2
+	result := runTest(t, scenario)
+
+	if result.Passed {
+		t.Fatal("result passed on a failed second delivery, want failure")
+	}
+	assertStatuses(t, result, http.StatusOK, http.StatusInternalServerError)
+	if !strings.Contains(result.Failure, "delivery 2 of 2 returned HTTP 500") {
+		t.Fatalf("failure = %q, want the delivery number and status", result.Failure)
+	}
+	if requests.Load() != 2 {
+		t.Fatalf("webhook requests = %d, want the run to stop after 2", requests.Load())
+	}
+}
+
+func TestRunFailsWhenFirstDeliveryDoesNotPersist(t *testing.T) {
+	app, dbPath := newTestApp(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		app.Handler().ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	scenario := testScenario(
+		server.URL+"/webhooks/paystack",
+		dbPath,
+		expectedPayment("ref_first_delivery_ignored"),
+		1*time.Second,
+	)
+	scenario.Deliveries = 2
+	result := runTest(t, scenario)
+
+	if result.Passed {
+		t.Fatal("result passed although the first delivery was ignored, want failure")
+	}
+	assertStatuses(t, result, http.StatusOK)
+	if requests.Load() != 1 {
+		t.Fatalf("webhook requests = %d, want the run to stop after the first delivery", requests.Load())
+	}
+	if !strings.Contains(result.Failure, "not found before timeout") {
+		t.Fatalf("failure = %q, want a missing-state message", result.Failure)
+	}
+}
+
+func TestRunRejectsNegativeDeliveryCount(t *testing.T) {
+	_, dbPath := newTestApp(t)
+	scenario := testScenario(
+		"http://127.0.0.1:1/webhooks/paystack",
+		dbPath,
+		expectedPayment("ref_negative_deliveries"),
+		time.Second,
+	)
+	scenario.Deliveries = -1
+
+	_, err := engine.Run(context.Background(), paystack.NewAdapter(testSecret), scenario)
+	if err == nil {
+		t.Fatal("engine.Run() error = nil, want an invalid delivery count error")
+	}
+	if !strings.Contains(err.Error(), "deliveries must not be negative") {
+		t.Fatalf("error = %q, want a delivery count message", err)
 	}
 }

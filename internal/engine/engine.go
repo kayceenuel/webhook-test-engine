@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kayceenuel/webhook-test-engine/internal/provider"
@@ -20,35 +22,47 @@ type Scenario struct {
 	TargetURL    string
 	DatabasePath string
 	Timeout      time.Duration
-	Expected     provider.Payment
+	// Deliveries is the number of times the same webhook is delivered
+	// sequentially. Zero means one delivery.
+	Deliveries int
+	Expected   provider.Payment
 }
 
 // Result describes the outcome of one webhook test.
 type Result struct {
-	Passed     bool
-	Provider   string
-	Reference  string
-	HTTPStatus int
-	Actual     *provider.Payment
-	Failure    string
+	Passed       bool
+	Provider     string
+	Reference    string
+	HTTPStatuses []int
+	Actual       *provider.Payment
+	Failure      string
 }
 
 // Summary returns a concise human-readable result line.
 func (r Result) Summary() string {
 	if r.Passed {
-		return fmt.Sprintf("PASS %s reference=%s http=%d state=verified",
-			r.Provider, r.Reference, r.HTTPStatus)
+		return fmt.Sprintf("PASS %s reference=%s http=%s state=verified",
+			r.Provider, r.Reference, formatStatuses(r.HTTPStatuses))
 	}
-	if r.HTTPStatus != 0 {
-		return fmt.Sprintf("FAIL %s reference=%s http=%d: %s",
-			r.Provider, r.Reference, r.HTTPStatus, r.Failure)
+	if len(r.HTTPStatuses) != 0 {
+		return fmt.Sprintf("FAIL %s reference=%s http=%s: %s",
+			r.Provider, r.Reference, formatStatuses(r.HTTPStatuses), r.Failure)
 	}
 	return fmt.Sprintf("FAIL %s reference=%s: %s", r.Provider, r.Reference, r.Failure)
 }
 
-// Run delivers one webhook and verifies the expected application state.
-// Returned errors indicate invalid scenario configuration. Operational
-// failures, including HTTP and database failures, are reported in Result.
+func formatStatuses(statuses []int) string {
+	parts := make([]string, len(statuses))
+	for i, status := range statuses {
+		parts[i] = strconv.Itoa(status)
+	}
+	return strings.Join(parts, ",")
+}
+
+// Run delivers a webhook one or more times and verifies the expected
+// application state. Returned errors indicate invalid scenario configuration.
+// Operational failures, including HTTP and database failures, are reported in
+// Result.
 func Run(ctx context.Context, adapter provider.Adapter, scenario Scenario) (Result, error) {
 	if adapter == nil {
 		return Result{}, errors.New("provider adapter is required")
@@ -89,45 +103,99 @@ func Run(ctx context.Context, adapter provider.Adapter, scenario Scenario) (Resu
 		return result, nil
 	}
 
-	status, err := deliver(runCtx, scenario.TargetURL, request)
-	if err != nil {
-		result.Failure = fmt.Sprintf("delivery failed: %v", err)
-		return result, nil
-	}
-	result.HTTPStatus = status
-	if status < http.StatusOK || status >= http.StatusMultipleChoices {
-		result.Failure = fmt.Sprintf("target returned HTTP %d", status)
-		return result, nil
+	deliveries := scenario.Deliveries
+	if deliveries == 0 {
+		deliveries = 1
 	}
 
 	expected := scenario.Expected
-	for {
-		if runCtx.Err() != nil {
-			setTimeoutFailure(&result, expected)
+	for delivery := 1; delivery <= deliveries; delivery++ {
+		status, err := deliver(runCtx, scenario.TargetURL, request)
+		if err != nil {
+			if deliveries == 1 {
+				result.Failure = fmt.Sprintf("delivery failed: %v", err)
+			} else {
+				result.Failure = fmt.Sprintf("delivery %d of %d failed: %v", delivery, deliveries, err)
+			}
+			return result, nil
+		}
+		result.HTTPStatuses = append(result.HTTPStatuses, status)
+		if status < http.StatusOK || status >= http.StatusMultipleChoices {
+			if deliveries == 1 {
+				result.Failure = fmt.Sprintf("target returned HTTP %d", status)
+			} else {
+				result.Failure = fmt.Sprintf("delivery %d of %d returned HTTP %d", delivery, deliveries, status)
+			}
 			return result, nil
 		}
 
-		actual, found, err := probe.Lookup(runCtx, expected.Reference)
-		if err != nil {
-			if runCtx.Err() != nil {
-				setTimeoutFailure(&result, expected)
-			} else {
-				result.Failure = probeFailure(runCtx, err)
+		// Verify after the first delivery as well as after the last one, so an
+		// application that ignores the first event cannot pass on a later one.
+		if delivery == 1 || delivery == deliveries {
+			if !verifyState(runCtx, probe, &result, expected) {
+				return result, nil
 			}
-			return result, nil
+		}
+	}
+
+	result.Passed = true
+	return result, nil
+}
+
+// verifyState waits for the expected payment to be stored, then confirms that
+// exactly one record exists for the reference. It reports failure by populating
+// result and returning false.
+func verifyState(ctx context.Context, probe *sqliteProbe, result *Result, expected provider.Payment) bool {
+	if !waitForExpectedState(ctx, probe, result, expected) {
+		return false
+	}
+
+	count, err := probe.Count(ctx, expected.Reference)
+	if err != nil {
+		if ctx.Err() != nil {
+			result.Failure = "timed out while counting payment records"
+		} else {
+			result.Failure = fmt.Sprintf("database query failed: %v", err)
+		}
+		return false
+	}
+	if count != 1 {
+		result.Failure = fmt.Sprintf("found %d records for reference %q; want 1",
+			count, expected.Reference)
+		return false
+	}
+	return true
+}
+
+// waitForExpectedState polls until the stored payment matches expected. It
+// reports failure by populating result and returning false.
+func waitForExpectedState(ctx context.Context, probe *sqliteProbe, result *Result, expected provider.Payment) bool {
+	for {
+		if ctx.Err() != nil {
+			setTimeoutFailure(result, expected)
+			return false
+		}
+
+		actual, found, err := probe.Lookup(ctx, expected.Reference)
+		if err != nil {
+			if ctx.Err() != nil {
+				setTimeoutFailure(result, expected)
+			} else {
+				result.Failure = probeFailure(ctx, err)
+			}
+			return false
 		}
 		if found {
 			result.Actual = &actual
 			if actual == expected {
-				result.Passed = true
-				return result, nil
+				return true
 			}
 		}
 
 		select {
-		case <-runCtx.Done():
-			setTimeoutFailure(&result, expected)
-			return result, nil
+		case <-ctx.Done():
+			setTimeoutFailure(result, expected)
+			return false
 		case <-time.After(pollInterval):
 		}
 	}
@@ -146,6 +214,9 @@ func validateScenario(scenario Scenario) error {
 	}
 	if scenario.Timeout <= 0 {
 		return errors.New("timeout must be greater than zero")
+	}
+	if scenario.Deliveries < 0 {
+		return errors.New("deliveries must not be negative")
 	}
 	if scenario.Expected.Reference == "" {
 		return errors.New("expected reference is required")

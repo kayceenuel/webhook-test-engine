@@ -67,3 +67,16 @@ func (p *sqliteProbe) Lookup(ctx context.Context, reference string) (provider.Pa
 	}
 	return payment, true, nil
 }
+
+// Count returns the number of payment records stored for reference.
+func (p *sqliteProbe) Count(ctx context.Context, reference string) (int, error) {
+	var count int
+	err := p.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM payments WHERE reference = ?`,
+		reference,
+	).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count payment records: %w", err)
+	}
+	return count, nil
+}
