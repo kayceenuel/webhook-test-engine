@@ -36,7 +36,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	reference := flags.String("reference", "", "payment reference (default: generated)")
 	amount := flags.Int64("amount", 50000, "amount in minor currency units, such as kobo")
 	currency := flags.String("currency", "NGN", "payment currency")
-	timeout := flags.Duration("timeout", 2*time.Second, "HTTP delivery and state verification timeout")
+	timeout := flags.Duration("timeout", 2*time.Second, "total scenario timeout covering preflight, all deliveries, and state verification")
 	deliveries := flags.Int("deliveries", 1, "number of times to deliver the same webhook sequentially")
 
 	if err := flags.Parse(args); err != nil {
